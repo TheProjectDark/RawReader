@@ -3,7 +3,7 @@ PKG_CONFIG ?= pkg-config
 GTK4_MIN_VERSION ?= 4.24.1
 STATIC ?= 0
 TARGET := rawreader
-SOURCES := src/main.c src/app.c src/block_device.c src/device.c src/fat32.c src/raw_reader.c src/hex_dump.c
+SOURCES := src/main.c src/app.c src/block_device.c src/device.c src/fat32.c src/ntfs.c src/raw_reader.c src/hex_dump.c
 OBJECTS := $(SOURCES:.c=.o)
 GTK_CFLAGS := $(shell $(PKG_CONFIG) --cflags gtk4 2>/dev/null)
 

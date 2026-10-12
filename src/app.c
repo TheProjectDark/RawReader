@@ -4,6 +4,7 @@
 #include "device.h"
 #include "fat32.h"
 #include "hex_dump.h"
+#include "ntfs.h"
 #include "raw_reader.h"
 
 #include <errno.h>
@@ -214,6 +215,82 @@ static void on_scan_fat32_clicked(GtkButton *button, gpointer user_data)
     block_device_close(device);
 }
 
+static void on_scan_ntfs_clicked(GtkButton *button, gpointer user_data)
+{
+    (void)button;
+    AppWidgets *widgets = user_data;
+    guint selected = gtk_drop_down_get_selected(GTK_DROP_DOWN(widgets->device_dropdown));
+    if (widgets->devices == NULL || selected == GTK_INVALID_LIST_POSITION
+        || selected >= widgets->devices->len) {
+        set_status(widgets, "Select a device first.", TRUE);
+        return;
+    }
+
+    RawDevice *raw_device = g_ptr_array_index(widgets->devices, selected);
+    GError *error = NULL;
+    BlockDevice *device = block_device_open(raw_device->path, &error);
+    if (device == NULL) {
+        set_status(widgets, error->message, TRUE);
+        g_clear_error(&error);
+        return;
+    }
+
+    NtfsVolume *volume = ntfs_volume_open(device, &error);
+    if (volume == NULL) {
+        set_status(widgets, error->message, TRUE);
+        g_clear_error(&error);
+        block_device_close(device);
+        return;
+    }
+
+    NtfsInfo info = ntfs_volume_get_info(volume);
+    GPtrArray *entries = ntfs_list_root(volume, &error);
+    if (entries == NULL) {
+        set_status(widgets, error->message, TRUE);
+        g_clear_error(&error);
+        ntfs_volume_close(volume);
+        block_device_close(device);
+        return;
+    }
+
+    GString *output = g_string_new(NULL);
+    g_string_append_printf(output,
+                           "NTFS volume\n"
+                           "Partition offset: %" G_GUINT64_FORMAT " bytes\n"
+                           "Volume size: %" G_GUINT64_FORMAT " bytes\n"
+                           "Sector size: %u bytes\n"
+                           "Cluster size: %u sectors (%u bytes)\n"
+                           "Data clusters: %" G_GUINT64_FORMAT "\n"
+                           "$MFT start cluster: %" G_GUINT64_FORMAT "\n\n"
+                           "Root directory (%u entries)\n",
+                           info.partition_offset, info.volume_size,
+                           info.bytes_per_sector, info.sectors_per_cluster,
+                           info.bytes_per_sector * info.sectors_per_cluster,
+                           info.cluster_count, info.mft_start_cluster, entries->len);
+    for (guint i = 0; i < entries->len; ++i) {
+        NtfsDirectoryEntry *entry = g_ptr_array_index(entries, i);
+        if (entry->is_directory) {
+            g_string_append_printf(output, "[DIR]  %s\n", entry->name);
+        } else {
+            g_string_append_printf(output, "%8" G_GUINT64_FORMAT "  %s\n",
+                                   entry->size, entry->name);
+        }
+    }
+
+    GtkTextBuffer *text_buffer =
+        gtk_text_view_get_buffer(GTK_TEXT_VIEW(widgets->output_view));
+    gtk_text_buffer_set_text(text_buffer, output->str, (gint)output->len);
+    gchar *message = g_strdup_printf("Read-only NTFS scan completed: %u root entries.",
+                                     entries->len);
+    set_status(widgets, message, FALSE);
+
+    g_free(message);
+    g_string_free(output, TRUE);
+    g_ptr_array_unref(entries);
+    ntfs_volume_close(volume);
+    block_device_close(device);
+}
+
 static GtkWidget *make_labeled_control(const gchar *label_text, GtkWidget *control)
 {
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
@@ -280,6 +357,8 @@ static void build_window(GtkApplication *application, AppWidgets *widgets)
     gtk_box_append(GTK_BOX(options_row), read_button);
     GtkWidget *scan_fat32_button = gtk_button_new_with_label("Scan FAT32");
     gtk_box_append(GTK_BOX(options_row), scan_fat32_button);
+    GtkWidget *scan_ntfs_button = gtk_button_new_with_label("Scan NTFS");
+    gtk_box_append(GTK_BOX(options_row), scan_ntfs_button);
     gtk_box_append(GTK_BOX(root), options_row);
 
     GtkWidget *output_scroller = make_output_scroller(widgets);
@@ -295,6 +374,8 @@ static void build_window(GtkApplication *application, AppWidgets *widgets)
     g_signal_connect(read_button, "clicked", G_CALLBACK(on_read_clicked), widgets);
     g_signal_connect(scan_fat32_button, "clicked",
                      G_CALLBACK(on_scan_fat32_clicked), widgets);
+    g_signal_connect(scan_ntfs_button, "clicked",
+                     G_CALLBACK(on_scan_ntfs_clicked), widgets);
     g_object_set_data_full(G_OBJECT(window), "rawreader-widgets", widgets,
                            app_widgets_free);
     gtk_window_present(GTK_WINDOW(window));

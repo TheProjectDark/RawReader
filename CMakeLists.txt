@@ -18,6 +18,7 @@ add_executable(rawreader
     src/block_device.c
     src/device.c
     src/fat32.c
+    src/ntfs.c
     src/raw_reader.c
     src/hex_dump.c
 )
