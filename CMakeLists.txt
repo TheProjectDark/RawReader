@@ -15,7 +15,9 @@ pkg_check_modules(GTK4 REQUIRED IMPORTED_TARGET "gtk4>=4.24.1")
 add_executable(rawreader
     src/main.c
     src/app.c
+    src/block_device.c
     src/device.c
+    src/fat32.c
     src/raw_reader.c
     src/hex_dump.c
 )

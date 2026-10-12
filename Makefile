@@ -3,7 +3,7 @@ PKG_CONFIG ?= pkg-config
 GTK4_MIN_VERSION ?= 4.24.1
 STATIC ?= 0
 TARGET := rawreader
-SOURCES := src/main.c src/app.c src/device.c src/raw_reader.c src/hex_dump.c
+SOURCES := src/main.c src/app.c src/block_device.c src/device.c src/fat32.c src/raw_reader.c src/hex_dump.c
 OBJECTS := $(SOURCES:.c=.o)
 GTK_CFLAGS := $(shell $(PKG_CONFIG) --cflags gtk4 2>/dev/null)
 
@@ -24,9 +24,14 @@ CFLAGS ?= -O2
 CFLAGS += -std=c11 -Wall -Wextra -Wpedantic
 LDLIBS += $(GTK_LIBS)
 
-.PHONY: all clean check-deps check-static-libs static-linux static-macos
+.PHONY: all clean check check-deps check-static-libs static-linux static-macos
 
 all: $(TARGET)
+
+check: check-deps
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o test-storage tests/test_storage.c src/block_device.c src/fat32.c $(LDLIBS)
+	./test-storage
+	rm -f test-storage
 
 check-deps:
 	@$(PKG_CONFIG) --atleast-version=$(GTK4_MIN_VERSION) gtk4 || { \
@@ -66,4 +71,4 @@ static-macos:
 	$(MAKE) STATIC=1 all
 
 clean:
-	rm -f rawreader rawreader-static $(OBJECTS)
+	rm -f rawreader rawreader-static test-storage $(OBJECTS)
