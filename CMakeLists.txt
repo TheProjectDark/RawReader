@@ -17,6 +17,7 @@ add_executable(rawreader
     src/app.c
     src/block_device.c
     src/device.c
+    src/ext4.c
     src/fat32.c
     src/ntfs.c
     src/raw_reader.c

@@ -9,6 +9,7 @@ typedef struct {
     gchar *name;
     gboolean is_directory;
     guint64 size;
+    guint64 record_number;
 } NtfsDirectoryEntry;
 
 typedef struct {
@@ -24,6 +25,10 @@ NtfsVolume *ntfs_volume_open(BlockDevice *device, GError **error);
 void ntfs_volume_close(NtfsVolume *volume);
 NtfsInfo ntfs_volume_get_info(const NtfsVolume *volume);
 GPtrArray *ntfs_list_root(NtfsVolume *volume, GError **error);
+GPtrArray *ntfs_list_directory(NtfsVolume *volume, guint64 record_number,
+                               GError **error);
+GBytes *ntfs_read_file(NtfsVolume *volume, guint64 record_number,
+                       guint64 offset, gsize length, GError **error);
 void ntfs_directory_entry_free(gpointer data);
 
 #endif

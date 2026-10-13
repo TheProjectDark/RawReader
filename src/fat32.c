@@ -327,20 +327,27 @@ static gboolean fat32_append_short_entry(GPtrArray *entries, const guint8 *raw,
     entry->name = name;
     entry->is_directory = (raw[11] & 0x10) != 0;
     entry->size = read_le32(raw + 28);
+    entry->first_cluster = ((guint32)(read_le16(raw + 20) & 0x0FFF) << 16)
+        | read_le16(raw + 26);
     g_ptr_array_add(entries, entry);
     return TRUE;
 }
 
-GPtrArray *fat32_list_root(Fat32Volume *volume, GError **error)
+GPtrArray *fat32_list_directory(Fat32Volume *volume, guint32 cluster,
+                                GError **error)
 {
     if (volume == NULL) {
         g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
                             "A FAT32 volume is required.");
         return NULL;
     }
+    if (cluster < 2 || cluster > volume->cluster_count + 1) {
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
+                            "The FAT32 directory cluster is out of range.");
+        return NULL;
+    }
 
     GPtrArray *entries = g_ptr_array_new_with_free_func(fat32_directory_entry_free);
-    guint32 cluster = volume->root_cluster;
     guint32 visited_clusters = 0;
     guint32 cluster_size = volume->bytes_per_sector * volume->sectors_per_cluster;
     gunichar2 long_name_units[260] = { 0 };
@@ -412,7 +419,10 @@ GPtrArray *fat32_list_root(Fat32Volume *volume, GError **error)
             gboolean valid_long_name =
                 has_long_name && expected_long_name_sequence == 0
                 && long_name_checksum == fat32_short_name_checksum(raw);
+            gboolean is_dot_entry =
+                raw[0] == '.' && (raw[1] == ' ' || (raw[1] == '.' && raw[2] == ' '));
             if ((raw[11] & 0x08) == 0
+                && !is_dot_entry
                 && !fat32_append_short_entry(entries, raw, long_name_units,
                                              valid_long_name, error)) {
                 g_bytes_unref(cluster_bytes);
@@ -441,4 +451,112 @@ GPtrArray *fat32_list_root(Fat32Volume *volume, GError **error)
 fail:
     g_ptr_array_unref(entries);
     return NULL;
+}
+
+GPtrArray *fat32_list_root(Fat32Volume *volume, GError **error)
+{
+    if (volume == NULL) {
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
+                            "A FAT32 volume is required.");
+        return NULL;
+    }
+    return fat32_list_directory(volume, volume->root_cluster, error);
+}
+
+GBytes *fat32_read_file(Fat32Volume *volume, guint32 first_cluster,
+                        guint64 file_size, guint64 offset, gsize length,
+                        GError **error)
+{
+    if (volume == NULL || length == 0 || offset > file_size
+        || (guint64)length > file_size - offset
+        || length > 16 * 1024 * 1024) {
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
+                            "The requested FAT32 file range is invalid or too large.");
+        return NULL;
+    }
+    if (first_cluster < 2 || first_cluster > volume->cluster_count + 1) {
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                            "The FAT32 file starts at an invalid cluster.");
+        return NULL;
+    }
+
+    guint32 cluster_size = volume->bytes_per_sector * volume->sectors_per_cluster;
+    guint64 cluster_index = offset / cluster_size;
+    if (cluster_index >= volume->cluster_count) {
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                            "The FAT32 file offset exceeds the volume cluster chain.");
+        return NULL;
+    }
+    guint32 cluster = first_cluster;
+    guint32 visited = 0;
+    for (guint64 i = 0; i < cluster_index; ++i) {
+        if (++visited > volume->cluster_count) {
+            g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                                "The FAT32 file contains a cyclic cluster chain.");
+            return NULL;
+        }
+        guint32 next_cluster = 0;
+        gboolean is_end = FALSE;
+        if (!fat32_next_cluster(volume, cluster, &next_cluster, &is_end, error)) {
+            return NULL;
+        }
+        if (is_end) {
+            g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                                "The FAT32 file cluster chain ends before its recorded size.");
+            return NULL;
+        }
+        cluster = next_cluster;
+    }
+
+    guint8 *buffer = g_malloc(length);
+    gsize copied = 0;
+    guint64 position = offset;
+    while (copied < length) {
+        if (++visited > volume->cluster_count) {
+            g_free(buffer);
+            g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                                "The FAT32 file contains a cyclic cluster chain.");
+            return NULL;
+        }
+        guint32 first_data_sector = volume->reserved_sectors
+            + volume->fat_count * volume->sectors_per_fat;
+        guint64 cluster_sector = (guint64)first_data_sector
+            + (guint64)(cluster - 2) * volume->sectors_per_cluster;
+        guint64 cluster_offset = volume->partition_offset
+            + cluster_sector * volume->bytes_per_sector;
+        GBytes *cluster_bytes =
+            block_device_read(volume->device, cluster_offset, cluster_size, error);
+        if (cluster_bytes == NULL) {
+            g_free(buffer);
+            return NULL;
+        }
+
+        gsize in_cluster = (gsize)(position % cluster_size);
+        gsize chunk = MIN(length - copied, cluster_size - in_cluster);
+        memcpy(buffer + copied,
+               (const guint8 *)g_bytes_get_data(cluster_bytes, NULL) + in_cluster,
+               chunk);
+        g_bytes_unref(cluster_bytes);
+        copied += chunk;
+        position += chunk;
+        if (copied == length) {
+            break;
+        }
+
+        guint32 next_cluster = 0;
+        gboolean is_end = FALSE;
+        if (!fat32_next_cluster(volume, cluster, &next_cluster, &is_end, error)) {
+            g_free(buffer);
+            return NULL;
+        }
+        if (is_end) {
+            g_free(buffer);
+            g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                                "The FAT32 file cluster chain ends before its recorded size.");
+            return NULL;
+        }
+        cluster = next_cluster;
+    }
+
+    return g_bytes_new_take(buffer, copied);
 }

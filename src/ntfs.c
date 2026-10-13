@@ -858,6 +858,7 @@ static gboolean ntfs_append_entry(NtfsIndexWalk *walk, const guint8 *entry,
     item->is_directory =
         (attributes & (NTFS_FILE_FLAG_DIRECTORY | NTFS_FILE_FLAG_DOS_DIRECTORY)) != 0;
     item->size = item->is_directory ? 0 : read_le64(key + 48);
+    item->record_number = record_number;
     g_ptr_array_add(walk->entries, item);
     return TRUE;
 }
@@ -962,7 +963,8 @@ static gboolean ntfs_walk_node(NtfsIndexWalk *walk, const guint8 *data,
     }
 }
 
-GPtrArray *ntfs_list_root(NtfsVolume *volume, GError **error)
+GPtrArray *ntfs_list_directory(NtfsVolume *volume, guint64 record_number,
+                               GError **error)
 {
     if (volume == NULL) {
         g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
@@ -982,23 +984,23 @@ GPtrArray *ntfs_list_root(NtfsVolume *volume, GError **error)
     guint32 total_size = 0;
     gboolean ok = FALSE;
 
-    record = ntfs_read_file_record(volume, NTFS_ROOT_RECORD, 0, error);
+    record = ntfs_read_file_record(volume, record_number, 0, error);
     if (record == NULL) {
         goto cleanup;
     }
     if ((read_le16(record + 22) & NTFS_RECORD_DIRECTORY) == 0) {
-        ntfs_set_invalid(error, "The NTFS root record is not a directory.");
+        ntfs_set_invalid(error, "The NTFS file record is not a directory.");
         goto cleanup;
     }
 
 
-    if (!ntfs_locate_attribute(volume, record, NTFS_ROOT_RECORD, NTFS_ATTR_INDEX_ROOT,
+    if (!ntfs_locate_attribute(volume, record, record_number, NTFS_ATTR_INDEX_ROOT,
                                ntfs_i30_name, G_N_ELEMENTS(ntfs_i30_name),
                                buffers, fragments, error)) {
         goto cleanup;
     }
     if (fragments->len != 1) {
-        ntfs_set_invalid(error, "The NTFS root directory has no usable $I30 index.");
+        ntfs_set_invalid(error, "The NTFS directory has no usable $I30 index.");
         goto cleanup;
     }
     if (!ntfs_resident_value(g_ptr_array_index(fragments, 0), &value, &value_length, error)) {
@@ -1016,14 +1018,14 @@ GPtrArray *ntfs_list_root(NtfsVolume *volume, GError **error)
         || !is_power_of_two(index_block_size)
         || first_entry < 16 || first_entry > total_size
         || 16 + (guint64)total_size > value_length) {
-        ntfs_set_invalid(error, "The NTFS root directory index header is invalid.");
+        ntfs_set_invalid(error, "The NTFS directory index header is invalid.");
         goto cleanup;
     }
 
     if ((value[28] & 0x01) != 0) {
 
         g_ptr_array_set_size(fragments, 0);
-        if (!ntfs_locate_attribute(volume, record, NTFS_ROOT_RECORD,
+        if (!ntfs_locate_attribute(volume, record, record_number,
                                    NTFS_ATTR_INDEX_ALLOCATION, ntfs_i30_name,
                                    G_N_ELEMENTS(ntfs_i30_name), buffers, fragments,
                                    error)) {
@@ -1061,4 +1063,94 @@ cleanup:
         return NULL;
     }
     return entries;
+}
+
+GPtrArray *ntfs_list_root(NtfsVolume *volume, GError **error)
+{
+    return ntfs_list_directory(volume, NTFS_ROOT_RECORD, error);
+}
+
+GBytes *ntfs_read_file(NtfsVolume *volume, guint64 record_number,
+                       guint64 offset, gsize length, GError **error)
+{
+    if (volume == NULL || length == 0 || length > 16 * 1024 * 1024) {
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
+                            "The requested NTFS file read must be between 1 byte and 16 MiB.");
+        return NULL;
+    }
+
+    guint8 *record = ntfs_read_file_record(volume, record_number, 0, error);
+    if (record == NULL) {
+        return NULL;
+    }
+    if ((read_le16(record + 22) & NTFS_RECORD_DIRECTORY) != 0) {
+        g_free(record);
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
+                            "The selected NTFS record is a directory.");
+        return NULL;
+    }
+
+    GPtrArray *buffers = g_ptr_array_new_with_free_func(g_free);
+    GPtrArray *fragments = g_ptr_array_new();
+    NtfsRunList runs = { 0 };
+    GBytes *result = NULL;
+    if (!ntfs_locate_attribute(volume, record, record_number, NTFS_ATTR_DATA,
+                               NULL, 0, buffers, fragments, error)) {
+        goto cleanup;
+    }
+    if (fragments->len == 0) {
+        ntfs_set_invalid(error, "The NTFS file has no unnamed $DATA attribute.");
+        goto cleanup;
+    }
+
+    const guint8 *first_attribute = g_ptr_array_index(fragments, 0);
+    guint16 data_flags = read_le16(first_attribute + 12);
+    if ((data_flags & 0x4001) != 0) {
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
+                            "Compressed or encrypted NTFS files are not supported.");
+        goto cleanup;
+    }
+    guint64 file_size = 0;
+    guint8 *contents = NULL;
+    if (first_attribute[8] == 0) {
+        const guint8 *value = NULL;
+        guint32 value_length = 0;
+        if (fragments->len != 1
+            || !ntfs_resident_value(first_attribute, &value, &value_length, error)) {
+            if (error != NULL && *error == NULL) {
+                ntfs_set_invalid(error, "The NTFS resident file data is fragmented.");
+            }
+            goto cleanup;
+        }
+        file_size = value_length;
+        if (offset > file_size || (guint64)length > file_size - offset) {
+            g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
+                                "The requested NTFS file range is outside the file.");
+            goto cleanup;
+        }
+        contents = g_memdup2(value + offset, length);
+    } else {
+        if (!ntfs_load_runs(volume, (const guint8 *const *)fragments->pdata,
+                            fragments->len, &runs, error)) {
+            goto cleanup;
+        }
+        file_size = runs.data_size;
+        if (offset > file_size || (guint64)length > file_size - offset) {
+            g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
+                                "The requested NTFS file range is outside the file.");
+            goto cleanup;
+        }
+        contents = ntfs_read_runs(volume, &runs, offset, length, error);
+        if (contents == NULL) {
+            goto cleanup;
+        }
+    }
+    result = g_bytes_new_take(contents, length);
+
+cleanup:
+    ntfs_run_list_clear(&runs);
+    g_ptr_array_unref(fragments);
+    g_ptr_array_unref(buffers);
+    g_free(record);
+    return result;
 }
